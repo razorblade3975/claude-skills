@@ -29,10 +29,16 @@ digraph consolidate_commits {
     present [label="Present grouping plan\nto user for approval" shape=box];
     approved [label="Approved?" shape=diamond];
     adjust [label="Adjust grouping\nper user feedback" shape=box];
+    reverify [label="Re-verify SHA list\nmatches Step 1" shape=box];
+    sha_match [label="SHA list\nunchanged?" shape=diamond];
+    reanalyze [label="Re-run Steps 1-4\nwith current commits" shape=box];
     backup [label="Create backup branch\npre-consolidate-{branch}-{timestamp}" shape=box];
     gen_script [label="Generate rebase\nsequence script" shape=box];
     rebase [label="Execute non-interactive\nrebase with GIT_SEQUENCE_EDITOR" shape=box];
-    conflicts [label="Conflicts?" shape=diamond];
+    check_outcome [label="Check outcome:\nsuccess / reschedule /\nconflict / failure" shape=diamond];
+    reschedule [label="Rescheduled step\n(no unmerged files)\nbounded retry" shape=box];
+    stalled [label="Stalled after\nmax retries?" shape=diamond];
+    conflicts [label="Real conflict\n(unmerged files present)" shape=box];
     resolve [label="Resolve conflicts\nand continue rebase" shape=box];
     reword [label="Reword squashed commits\nto reflect merged changes" shape=box];
     verify [label="Verify: diff backup\nbranch vs new HEAD" shape=box];
@@ -40,7 +46,7 @@ digraph consolidate_commits {
     rollback [label="Rollback: reset to\nbackup branch" shape=box];
     cleanup [label="Delete backup branch" shape=box];
     done [label="Done" shape=doublecircle];
-    failed [label="Report failure\nbackup branch preserved" shape=doublecircle];
+    failed [label="Abort + restore from\nbackup branch\n(branch preserved)" shape=doublecircle];
 
     start -> find_base;
     find_base -> list_commits;
@@ -50,15 +56,25 @@ digraph consolidate_commits {
     analyze -> group;
     group -> present;
     present -> approved;
-    approved -> backup [label="yes"];
+    approved -> reverify [label="yes"];
     approved -> adjust [label="no"];
     adjust -> present;
+    reverify -> sha_match;
+    sha_match -> backup [label="yes"];
+    sha_match -> reanalyze [label="no"];
+    reanalyze -> present;
     backup -> gen_script;
     gen_script -> rebase;
-    rebase -> conflicts;
-    conflicts -> resolve [label="yes"];
-    resolve -> conflicts [label="more?"];
-    conflicts -> reword [label="no"];
+    rebase -> check_outcome;
+    check_outcome -> reschedule [label="rescheduled\n(no unmerged files)"];
+    check_outcome -> conflicts [label="conflict\n(unmerged files)"];
+    check_outcome -> reword [label="success"];
+    check_outcome -> failed [label="failure\n(no rebase-merge)"];
+    reschedule -> stalled;
+    stalled -> rebase [label="no\n(step advanced)"];
+    stalled -> failed [label="yes\n(same step 2x)"];
+    conflicts -> resolve;
+    resolve -> rebase [label="git rebase\n--continue"];
     reword -> verify;
     verify -> diff_clean;
     diff_clean -> cleanup [label="yes"];
@@ -189,7 +205,17 @@ Group 3 (squash): "fix(export): handle unicode characters in CSV export"
 
 ### Step 5: Create Backup Branch, Generate Sequence, and Execute
 
-**First, create a backup branch** so the original commits are fully preserved and recoverable:
+**First, re-verify the commit list hasn't changed since Step 1.** New commits may have been added between analysis and execution (by hooks, background processes, or other sessions):
+
+```bash
+# Re-list the full ordered SHA list — must match exactly what was analyzed in Step 1
+CURRENT_SHAS=$(git rev-list --reverse $BASE_BRANCH..HEAD)
+echo "$CURRENT_SHAS"
+```
+
+Compare this SHA list against the commits analyzed in Steps 1-3. If **any** SHA is different, missing, or new (not just count — amended commits can keep the same count), **STOP and re-analyze.** Re-run Steps 1-4 with the current commit list. A stale todo file will silently drop any commits not listed, and the verification diff in Step 7 will catch it — but it's better to prevent it here than to roll back later.
+
+**Then, create a backup branch** so the original commits are fully preserved and recoverable:
 
 ```bash
 # Create a backup branch with a descriptive name
@@ -314,16 +340,26 @@ GIT_EDITOR="$MSG_SCRIPT" \
 
 **Critical:** `GIT_SEQUENCE_EDITOR` handles the todo list (reorder + pick/squash). `GIT_EDITOR` handles the commit message prompts during squash, using a counter to match groups deterministically.
 
-**After the rebase command returns, check the outcome:**
+**After the rebase command returns, check the outcome.** There are FOUR possible states, not just two:
 
 1. **Success (exit 0):** Rebase completed cleanly. Proceed to Step 7 (verify). Clean up temp files:
    ```bash
    rm -f "$SEQ_SCRIPT" "$MSG_SCRIPT" "$MSG_COUNTER"
    ```
 
-2. **Conflict (rebase paused):** Git exits non-zero and leaves a `.git/rebase-merge/` directory. This is normal — proceed to Step 6 to resolve conflicts. **Do NOT clean up temp files yet** — `GIT_EDITOR` is still needed when `git rebase --continue` triggers squash message editing.
+2. **Rescheduling (exit non-zero, `.git/rebase-merge/` exists, NO unmerged files):** When squashing commits that heavily modify the same files, git may exit non-zero with the error:
+   ```
+   error: Your local changes to the following files would be overwritten by merge
+   ```
+   followed by "It has been rescheduled." **This is NOT a conflict.** There are no conflict markers and no unmerged files. The failed todo item is simply re-queued. The fix is straightforward — just continue:
+   ```bash
+   GIT_EDITOR="$MSG_SCRIPT" git rebase --continue
+   ```
+   This may happen **multiple times** during a single rebase (once per problematic squash step). Each time, just continue. **Do NOT clean up temp files** — `GIT_EDITOR` is still needed.
 
-3. **Unexpected failure (no `.git/rebase-merge/`):** The rebase failed for a non-conflict reason (bad todo, hook failure, etc.). Abort and restore from backup:
+3. **Conflict (exit non-zero, `.git/rebase-merge/` exists, unmerged files present):** A real merge conflict requiring manual resolution. Proceed to Step 6. **Do NOT clean up temp files yet.**
+
+4. **Unexpected failure (exit non-zero, no `.git/rebase-merge/`):** The rebase failed for a non-conflict reason (bad todo, hook failure, etc.). Abort and restore from backup:
    ```bash
    rm -f "$SEQ_SCRIPT" "$MSG_SCRIPT" "$MSG_COUNTER"
    git rebase --abort 2>/dev/null
@@ -333,11 +369,59 @@ GIT_EDITOR="$MSG_SCRIPT" \
    ```
    Report the error to the user. Backup branch is preserved.
 
-**How to distinguish conflict from failure:** After a non-zero exit, check if `.git/rebase-merge/` exists. If yes → conflict (Step 6). If no → unexpected failure (abort and restore).
+**How to distinguish the three non-zero exit states:**
+
+```bash
+# After a non-zero rebase exit:
+if [ ! -d "$(git rev-parse --git-dir)/rebase-merge" ]; then
+    echo "UNEXPECTED FAILURE — abort and restore"
+elif [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+    echo "CONFLICT — needs manual resolution (Step 6)"
+else
+    echo "RESCHEDULED — just run: git rebase --continue"
+fi
+```
+
+**Guarding against misclassified rescheduling:** The "no rebase-merge + no unmerged files" state can also occur with hook failures or write errors. To avoid looping forever on a false "rescheduled" classification, apply a **bounded retry with progress tracking**:
+
+- Before each `git rebase --continue`, record the current rebase step number from `.git/rebase-merge/msgnum`.
+- After `--continue` returns non-zero, check the step number again. If it advanced, the rescheduling was genuine — continue the loop. If it did NOT advance after 2 consecutive attempts on the same step, **classify as unexpected failure** and abort + restore from backup.
+
+```bash
+# Example bounded retry loop for rescheduling
+MAX_STALLS=2
+STALL_COUNT=0
+PREV_STEP=""
+
+while true; do
+    GIT_EDITOR="$MSG_SCRIPT" git rebase --continue
+    RC=$?
+    [ $RC -eq 0 ] && break  # success
+
+    if [ ! -d "$(git rev-parse --git-dir)/rebase-merge" ]; then
+        echo "UNEXPECTED FAILURE"; break
+    elif [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+        echo "CONFLICT"; break  # proceed to Step 6
+    fi
+
+    # Rescheduled — check progress
+    CURR_STEP=$(cat "$(git rev-parse --git-dir)/rebase-merge/msgnum" 2>/dev/null)
+    if [ "$CURR_STEP" = "$PREV_STEP" ]; then
+        STALL_COUNT=$((STALL_COUNT + 1))
+        if [ $STALL_COUNT -ge $MAX_STALLS ]; then
+            echo "STALLED on step $CURR_STEP after $MAX_STALLS retries — classifying as failure"
+            break
+        fi
+    else
+        STALL_COUNT=0
+    fi
+    PREV_STEP="$CURR_STEP"
+done
+```
 
 ### Step 6: Handle Conflicts
 
-If the rebase paused due to a conflict (`.git/rebase-merge/` exists):
+Enter Step 6 **only when unmerged files are present** (confirmed by `git diff --name-only --diff-filter=U` returning results). The presence of `.git/rebase-merge/` alone does NOT imply a conflict — it may indicate a rescheduled step instead (see Step 5 classifier).
 
 1. Identify the conflicting files:
    ```bash
@@ -458,6 +542,10 @@ If analysis shows no commits should be merged (all fall into "do not merge" crit
 | Running `git reset --hard` without verifying ref | Always check `$BACKUP_BRANCH` is non-empty and valid before reset |
 | Not presenting plan to user first | Always get approval before executing rebase |
 | Forgetting `GIT_EDITOR` for squash messages | Squash needs both `GIT_SEQUENCE_EDITOR` AND `GIT_EDITOR` |
+| Using a stale commit list for the todo file | Re-verify full SHA list (not just count) matches Step 1 before creating backup in Step 5 |
+| Treating rescheduled steps as conflicts | Check for unmerged files — no unmerged files means rescheduled, just `--continue` |
+| Aborting on rescheduled squash steps | "Your local changes would be overwritten" during squash is normal — just `--continue` |
+| Looping forever on misclassified rescheduling | Use bounded retry with `.git/rebase-merge/msgnum` progress tracking — abort after 2 stalls on same step |
 
 ## Red Flags
 
@@ -477,6 +565,7 @@ If analysis shows no commits should be merged (all fall into "do not merge" crit
 
 **Always:**
 - Check for in-progress git operations before starting
+- Re-verify full SHA list before executing (prevent stale todo file from dropping commits)
 - Create a backup branch (`pre-consolidate/`) before rebasing
 - Handle detached HEAD in backup branch naming (use short SHA)
 - Use `mktemp` for temp script files, clean them up after
@@ -488,6 +577,8 @@ If analysis shows no commits should be merged (all fall into "do not merge" crit
 - Verify with `git diff --quiet "$BACKUP_BRANCH" HEAD` — must exit 0 (end state unchanged)
 - Delete backup branch only after verification passes
 - Preserve backup branch on any failure (for user recovery)
+- Distinguish rescheduled steps from real conflicts (check for unmerged files)
+- Handle rescheduled steps by simply running `git rebase --continue` (not aborting)
 - Guard all destructive commands (`reset --hard`, `branch -D`) with ref-existence checks
-- Handle conflicts carefully, or abort and ask user
+- Handle real conflicts carefully, or abort and ask user
 - Report the final consolidated log to the user
