@@ -1,6 +1,6 @@
 # Claude Code Skills
 
-Custom skills for [Claude Code](https://claude.com/claude-code) that extend its capabilities with structured workflows for code quality and git hygiene.
+Custom skills for [Claude Code](https://claude.com/claude-code) that extend its capabilities with structured workflows for code quality, debugging, and git hygiene.
 
 ## Skills
 
@@ -29,12 +29,20 @@ Gets an independent code review from OpenAI Codex CLI, then iterates until conse
 - Evaluates feedback with technical rigor — accepts valid issues, pushes back on incorrect ones
 - Iterates up to 3 rounds, then reports a structured summary of resolved issues, rejections, and deferrals
 
+### codex-debugger
+
+Gets an independent debugging perspective from OpenAI Codex CLI, then iterates on hypotheses until root cause is identified:
+
+- Sends bug context — error traces, relevant source code, reproduction steps, and what's been tried
+- Evaluates Codex's hypotheses against the actual codebase with technical rigor
+- Iterates up to 3 rounds narrowing scope with new evidence, then reports root cause and fix or escalates
+
 ## Installation
 
 Copy the skill directories into your Claude Code skills folder:
 
 ```bash
-cp -r finalize-code consolidate-commits codex-reviewer ~/.claude/skills/
+cp -r finalize-code consolidate-commits codex-reviewer codex-debugger ~/.claude/skills/
 ```
 
 ## Usage
@@ -44,3 +52,4 @@ Invoke any skill from Claude Code by name:
 - `/finalize-code` — after finishing implementation work
 - `/consolidate-commits` — before creating a PR or merging
 - `/codex-reviewer` — when you want a second opinion on your changes
+- `/codex-debugger` — when stuck on a bug and want a second pair of eyes
