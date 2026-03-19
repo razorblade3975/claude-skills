@@ -11,6 +11,8 @@ Use OpenAI Codex CLI to get an independent code review of your session changes, 
 
 **Core principle:** Two AI reviewers catch more than one. Get Codex's perspective, evaluate it with technical rigor (receiving-code-review), fix what's valid, push back on what's wrong, and iterate until you agree.
 
+**Minimum 2 rounds — mandatory.** Even if Round 1 finds zero issues, you MUST send a Round 2 confirmation pass. A clean Round 1 is not proof of correctness — it may mean the reviewer was too shallow. Round 2 forces a deeper second look. Never short-circuit to "no issues found" after a single round.
+
 ## When to Use
 
 - After completing implementation work and before reporting back to user
@@ -31,13 +33,14 @@ digraph codex_review {
     receive1 [label="Evaluate feedback\n(receiving-code-review)" shape=box];
     has_valid [label="Valid issues found?" shape=diamond];
     fix [label="Fix valid issues\nPush back on invalid ones" shape=box];
-    round2 [label="Send to Codex for Round 2\ninclude what changed and why" shape=box];
+    round2_fixes [label="Round 2: review fixes\ninclude what changed and why" shape=box];
+    round2_confirm [label="Round 2: confirmation pass\nask Codex to look deeper" shape=box];
     read2 [label="Read Codex output file" shape=box];
     receive2 [label="Evaluate Round 2 feedback\n(receiving-code-review)" shape=box];
-    consensus [label="Consensus reached?" shape=diamond];
-    more_rounds [label="Fix remaining issues\nSend Round N" shape=box];
-    report [label="Report summary to user" shape=doublecircle];
-    no_issues [label="Report: no issues found" shape=doublecircle];
+    has_valid2 [label="Valid issues found?" shape=diamond];
+    fix2 [label="Fix remaining issues" shape=box];
+    round3 [label="Round 3 (if needed)" shape=box];
+    report [label="Report summary to user\n(minimum 2 rounds completed)" shape=doublecircle];
 
     start -> gather;
     gather -> round1;
@@ -45,14 +48,16 @@ digraph codex_review {
     read1 -> receive1;
     receive1 -> has_valid;
     has_valid -> fix [label="yes"];
-    has_valid -> no_issues [label="no"];
-    fix -> round2;
-    round2 -> read2;
+    has_valid -> round2_confirm [label="no — still must do Round 2"];
+    fix -> round2_fixes;
+    round2_fixes -> read2;
+    round2_confirm -> read2;
     read2 -> receive2;
-    receive2 -> consensus;
-    consensus -> report [label="yes"];
-    consensus -> more_rounds [label="no"];
-    more_rounds -> receive2;
+    receive2 -> has_valid2;
+    has_valid2 -> report [label="no — consensus after 2+ rounds"];
+    has_valid2 -> fix2 [label="yes"];
+    fix2 -> round3;
+    round3 -> report [label="cap at 3 rounds"];
 }
 ```
 
@@ -143,7 +148,13 @@ For each piece of feedback:
 
 **No performative agreement.** If Codex is wrong, say why and move on.
 
-### Step 4: Round 2 — Send Amendments Back
+**Regardless of whether Round 1 found issues, proceed to Round 2.** Do NOT stop here.
+
+### Step 4: Round 2 — MANDATORY (always required)
+
+Round 2 is always required, even if Round 1 found zero issues. Choose the appropriate variant:
+
+**Variant A — Round 1 found issues (review fixes):**
 
 After fixing valid issues, send Codex the updated state with full context of what changed:
 
@@ -169,13 +180,44 @@ Updated diff:
 $DIFF_R2"
 ```
 
+**Variant B — Round 1 found no issues (confirmation pass):**
+
+A clean Round 1 does not mean the code is clean — it may mean the first pass was too shallow. Send a confirmation pass with a different angle:
+
+```bash
+REVIEW_FILE_R2="/tmp/codex-review-$(date +%s)-r2.md"
+DIFF_R2=$(git diff HEAD && git diff --cached)
+
+codex exec \
+  --skip-git-repo-check \
+  --sandbox read-only \
+  -o "$REVIEW_FILE_R2" \
+  "Round 2 confirmation pass. Your Round 1 review found no issues. Please look again more carefully with fresh eyes.
+
+Specifically check for:
+- Subtle logic errors or off-by-one mistakes
+- Missing edge cases or error handling gaps
+- Concurrency or state management issues
+- Security concerns (injection, auth, data exposure)
+- Performance problems under load
+- Violations of the project's conventions or architecture
+
+Context: {WHAT_WAS_DONE_AND_WHY}
+Plan/Requirements: {PLAN_OR_REQUIREMENTS}
+
+Diff:
+$DIFF_R2"
+```
+
 ### Step 5: Evaluate Round 2 and Iterate
 
 Read the Round 2 output file and apply `receiving-code-review` again. If new valid issues surface, fix and send Round 3. Continue until:
 
-- Codex confirms fixes are good, OR
+- Codex confirms fixes are good (after minimum 2 rounds), OR
 - You and Codex reach technical consensus (agree or agree-to-disagree with reasoning), OR
 - Maximum 3 rounds (diminishing returns — escalate remaining disagreements to user)
+
+**The earliest you may stop and report to the user is after completing Round 2 evaluation.**
 
 ### Step 6: Report to User
 
@@ -206,7 +248,8 @@ Provide a structured summary:
 |---------|-----|
 | Accepting all Codex feedback blindly | Verify each item against codebase reality |
 | Sending diff without context | Always include what/why/plan |
-| Skipping Round 2 | Always iterate — Round 1 fixes may introduce new issues |
+| Skipping Round 2 after clean Round 1 | Round 2 is MANDATORY — a clean Round 1 may be a shallow Round 1. Always send a confirmation pass |
+| Skipping Round 2 after fixing Round 1 issues | Round 2 is MANDATORY — fixes may introduce new issues. Always send fixes back for re-review |
 | Endless iteration (4+ rounds) | Cap at 3 rounds, escalate disagreements to user |
 | Not reporting pushback items | User needs to know what was rejected and why |
 | Using interactive codex or `codex review` piped | Always use `codex exec --skip-git-repo-check --sandbox read-only -o` — `codex review` doesn't output when piped |
