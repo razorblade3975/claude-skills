@@ -26,7 +26,9 @@ Codegen variables are Python classes that define stateful computation graphs com
 | book_values.py `port` param | String or list | `"BINANCE:PERP:AVAX/USDT"` |
 | pricing_models.py `product` param | String or list | `"BINANCE:PERP:AVAX/USDT"` |
 
-**Silent failure mode:** A malformed port (e.g., `["BINANCE", "PERP", "AVAXUSDT"]`) will compile, run, and produce only `timed_1000ms` events with all values = 0. The sim does not error — the product simply never matches any market data.
+Both string and list formats work — `lib.TradeUnit.load()` maps list elements positionally to `(product, inst_type, book_specific_id)`. The silent failure comes from **wrong list shape** (e.g., 3-element `["BINANCE", "PERP", "AVAXUSDT"]` instead of string `"BINANCE:PERP:AVAX/USDT"`). Use the full internal_name string for sim JSON params — it's always correct.
+
+**Silent failure mode:** A malformed port compiles, runs, and produces only `timed_1000ms` events with all values = 0. The sim does not error — the product simply never matches any market data.
 
 **Diagnostic:** If your output has only `timed_1000ms` events and no `quote`/`trade` events, the port format is wrong.
 
@@ -49,8 +51,12 @@ class MyVariable(lib.Variable):
         # Pattern B: always ready (synthetic/sampler variables)
         # self.is_ready = True
 
+        # Reset on readiness transitions (standard for stateful vars)
+        reset_cond = lib.changed(self.is_ready)
+
         # Value computation using Cell + .on()
         value = Cell(0.0, type="double")
+        value.on(reset_cond, 0.0)             # Reset when readiness changes
         value.on(event_condition, new_value_expression)
 
         self.value = value
@@ -65,7 +71,7 @@ c.on(condition, new_value)        # Update when condition true
 c.prev()                          # Pre-update value (same cycle)
 ```
 
-**Cell.on() semantics:** `c` in the expression refers to the **pre-update** value. Multiple `.on()` calls on the same event fire in **registration order**.
+**Cell.on() semantics:** When multiple `.on()` calls trigger on the same event, they fire in **registration order** and each handler mutates the cell. Later handlers see the result of earlier ones. Use `c.prev()` to get the true start-of-event value. This is why handler registration order matters critically (e.g., capture direction BEFORE updating `last_px`).
 
 ### Events
 | Function | Fires on |
@@ -102,10 +108,20 @@ event, samplecount, decay = samplers.make_multi_sampler(sampler_spec)
 
 ### Pricing Models
 ```python
-pm = factory.load(pm_spec)  # Load from JSON spec
-px = pm.price               # Access price node
-ready = pm.is_ready          # Access readiness
+# From JSON spec (full loadable form):
+pm = factory.load(["vars.pricing_models.MktSwitchMid", {"product": port}])
+
+# Inside a Variable class (with default fallback):
+from vars.pricing_models import MktSwitchMid, load_pm
+if ref_pm is None:
+    ref_pm = MktSwitchMid(port)
+else:
+    ref_pm = load_pm(port, ref_pm)  # handles alias resolution
+px = ref_pm.price
+ready = ref_pm.is_ready
 ```
+
+**Note:** `factory.load()` only works for full `["module.Class", {params}]` specs. For alias strings, use `load_pm()` from `pricing_models.py`.
 
 ## Verification Workflow
 
@@ -158,11 +174,14 @@ Example with pricing model nesting:
 
 | Mistake | Symptom | Fix |
 |---------|---------|-----|
-| Wrong port format (list vs string) | All zeros, only `timed_1000ms` events | Use `"EXCHANGE:TYPE:BASE/QUOTE"` string |
+| Wrong port format (wrong list shape) | All zeros, only `timed_1000ms` events | Use `"EXCHANGE:TYPE:BASE/QUOTE"` string |
 | Cell.on() order wrong | Direction/diff captured after update | Register dependent `.on()` BEFORE the updating `.on()` |
 | Missing `lib.is_ready()` guard | NaN/garbage during warmup | Guard events: `event & lib.is_ready(port)` |
 | Using `&` for bitwise | Gets logical AND instead | Use `fn("&")(a, b)` for bitwise |
 | Assuming function semantics | Silent wrong values | Read the source in `lib.py` before using unfamiliar functions |
+| Missing reset on readiness | Stale values after reconnect | Add `value.on(lib.changed(is_ready), 0.0)` — see `trade_count.py:22` |
+| Using `factory.load()` for PM alias | AttributeError on `.price` | Use `load_pm()` from `pricing_models.py` for alias resolution |
+| PricingModel in JSON without wrapper | Column named `_price` not `_value` | Wrap with `PricingModelVariable` if you want `_value` column |
 | No verification run | Broken variable ships | Always run gen_data_algo_engine_sim and inspect output |
 
 ## Existing Variable Files (Pattern Reference)
